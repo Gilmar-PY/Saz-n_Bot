@@ -8,7 +8,14 @@ import re
 import pytz
 import json
 import logging
-from word2number import w2n  # Importación añadida
+from word2number import w2n  # Importación necesaria para convertir palabras a números
+import nltk
+from nltk.tokenize import word_tokenize
+from nltk import pos_tag, ne_chunk
+
+# Descargar datos necesarios de nltk
+nltk.download('punkt')
+nltk.download('averaged_perceptron_tagger')
 
 # Configura el logger
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -28,8 +35,8 @@ st.markdown(intro)
 # Cargar el menú desde un archivo CSV
 def load(file_path):
     """Cargar el menú desde un archivo CSV con columnas Plato, Descripción y Precio."""
-    load = pd.read_csv(file_path)
-    return load
+    data = pd.read_csv(file_path)
+    return data
 
 def format_menu(menu):
     if menu.empty:
@@ -107,6 +114,8 @@ def get_system_prompt(menu, distritos):
     - Si la cantidad solicitada está en el rango de 1 a 100 (inclusive), acepta el pedido sin mostrar advertencias.
     - Si la cantidad solicitada es mayor que 100, muestra el siguiente mensaje:
       "Lamento informarte que el límite máximo de cantidad por producto es de 100 unidades. Por favor, reduce la cantidad para procesar tu pedido."
+
+    - Si el usuario solicita múltiples productos en un solo mensaje, procesa cada uno de ellos siguiendo las mismas reglas.
 
     Pregunta si desea recoger su pedido en el local o si prefiere entrega a domicilio. 
     Si elige entrega, pregúntale al cliente a qué distrito desea que se le envíe su pedido, confirma que el distrito esté dentro de las zonas de reparto y verifica el distrito de entrega con el cliente.
@@ -210,29 +219,43 @@ def generate_response(prompt, temperature=0.5, max_tokens=1000):
     logging.info(json.dumps(order_json, indent=4) if order_json else '{}')
     return response
 
-# Función para convertir cantidades escritas en palabras a números
-def extract_quantity_and_item(user_input):
-    # Convierte el input a minúsculas para uniformidad
+# Función para convertir cantidades escritas en palabras a números y extraer productos
+def extract_quantities_and_items(user_input):
     user_input = user_input.lower()
-    words = user_input.split()
-    quantity = None
-    item = None
+    tokens = word_tokenize(user_input)
+    tagged_tokens = pos_tag(tokens)
 
-    # Recorre las palabras para encontrar la cantidad y el ítem
-    for i, word in enumerate(words):
-        try:
-            # Intenta convertir la palabra a número
-            quantity = w2n.word_to_num(word)
-            # Asume que la siguiente palabra es el ítem
-            item = ' '.join(words[i+1:])
-            break
-        except ValueError:
-            # Si no es un número, verifica si es un dígito
-            if word.isdigit():
-                quantity = int(word)
-                item = ' '.join(words[i+1:])
-                break
-    return quantity, item
+    quantities = []
+    items = []
+    quantity = None
+    item = ''
+
+    for word, tag in tagged_tokens:
+        if tag == 'CD':  # Cardinal numbers
+            try:
+                # Intenta convertir el número en texto a entero
+                quantity = w2n.word_to_num(word)
+            except ValueError:
+                if word.isdigit():
+                    quantity = int(word)
+                else:
+                    quantity = None
+        elif tag == 'NN' or tag == 'NNS' or tag == 'JJ':
+            item += word + ' '
+        elif word == ',' or word == 'y':
+            if quantity is not None and item.strip() != '':
+                quantities.append(quantity)
+                items.append(item.strip())
+                quantity = None
+                item = ''
+        else:
+            item += word + ' '
+
+    if quantity is not None and item.strip() != '':
+        quantities.append(quantity)
+        items.append(item.strip())
+
+    return quantities, items
 
 initial_state = [
     {"role": "system", "content": get_system_prompt(menu, distritos)},
@@ -262,9 +285,14 @@ for message in st.session_state.messages:
             st.markdown(message["content"])
 
 if prompt := st.chat_input():
-    # Extraer cantidad e ítem
-    quantity, item = extract_quantity_and_item(prompt)
-    if quantity is not None and quantity > 100:
+    # Extraer cantidades e ítems
+    quantities, items = extract_quantities_and_items(prompt)
+    invalid_items = []
+    for qty in quantities:
+        if qty > 100:
+            invalid_items.append(qty)
+
+    if invalid_items:
         with st.chat_message("assistant", avatar="👨‍🍳"):
             st.markdown(
                 "Lamento informarte que el límite máximo de cantidad por producto es de 100 unidades. Por favor, reduce la cantidad para procesar tu pedido."
